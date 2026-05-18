@@ -5,6 +5,7 @@ TRUNCATE backend.seat CASCADE;
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
 
+-----------------------------------------------------------
 CREATE OR REPLACE FUNCTION backend.fill_sample_data()
 RETURNS boolean
 LANGUAGE plpgsql
@@ -70,6 +71,7 @@ $$;
 SELECT backend.fill_sample_data();
 
 
+-----------------------------------------------------------
 CREATE OR REPLACE FUNCTION backend.fill_sample_user_data()
 RETURNS boolean
 LANGUAGE plpgsql
@@ -127,3 +129,107 @@ END;
 $$;
 
 SELECT backend.fill_sample_user_data();
+
+-----------------------------------------------------------
+CREATE OR REPLACE FUNCTION backend.generate_test_tickets()
+RETURNS TABLE (
+    profile_id BIGINT,
+    reservation_id BIGINT,
+    ticket_id BIGINT
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+v_profile RECORD;
+    v_travel_id BIGINT;
+    v_seat_id BIGINT;
+    v_start_stop INT;
+    v_end_stop INT;
+    v_max_stop INT;
+    v_reservation_id BIGINT;
+    v_ticket_id BIGINT;
+BEGIN
+    FOR v_profile IN
+    SELECT p.profile_id, p.user_id
+    FROM backend.profile p
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM backend.ticket t
+        WHERE t.profile_id = p.profile_id
+    )
+    ORDER BY p.profile_id
+        LOOP
+    SELECT t.travel_id, MAX(tr.travel_stop_number)
+    INTO v_travel_id, v_max_stop
+    FROM backend.travel t
+             JOIN backend.travel_route tr ON tr.travel_id = t.travel_id
+    WHERE EXISTS (
+        SELECT 1
+        FROM backend.seat s
+        WHERE s.travel_id = t.travel_id
+    )
+    GROUP BY t.travel_id
+    HAVING COUNT(DISTINCT tr.travel_stop_number) >= 2
+    ORDER BY random()
+        LIMIT 1;
+
+    IF v_travel_id IS NULL OR v_max_stop IS NULL OR v_max_stop < 2 THEN
+                CONTINUE;
+    END IF;
+
+    SELECT s.seat_id
+    INTO v_seat_id
+    FROM backend.seat s
+    WHERE s.travel_id = v_travel_id
+    ORDER BY random()
+        LIMIT 1;
+
+    IF v_seat_id IS NULL THEN
+                CONTINUE;
+    END IF;
+
+    v_start_stop := 1 + floor(random() * (v_max_stop - 1))::int;
+    v_end_stop := v_start_stop + 1 + floor(random() * (v_max_stop - v_start_stop))::int;
+
+    BEGIN
+        SELECT r.reservation_id
+        INTO v_reservation_id
+        FROM backend.reserve_seat(
+                     v_seat_id,
+                     v_profile.profile_id,
+                     v_start_stop,
+                     v_end_stop
+        ) AS r;
+
+        IF v_reservation_id IS NULL THEN
+                        CONTINUE;
+        END IF;
+
+        SELECT b.ticket_id
+        INTO v_ticket_id
+        FROM backend.buy_ticket(
+                     v_reservation_id,
+                     v_profile.user_id
+        ) AS b;
+
+        IF v_ticket_id IS NULL THEN
+                        CONTINUE;
+        END IF;
+
+        profile_id := v_profile.profile_id;
+        reservation_id := v_reservation_id;
+        ticket_id := v_ticket_id;
+        RETURN NEXT;
+
+    EXCEPTION
+            WHEN OTHERS THEN
+                RAISE NOTICE 'Skip profile_id=%, error=%', v_profile.profile_id, SQLERRM;
+            CONTINUE;
+            END;
+            END LOOP;
+
+    RETURN;
+END;
+$$;
+
+SELECT * FROM backend.generate_test_tickets();
