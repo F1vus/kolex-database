@@ -1,0 +1,128 @@
+CREATE OR REPLACE FUNCTION backend.find_paid_tickets_by_user_id(userId BIGINT)
+RETURNS SETOF backend.ticket
+LANGUAGE sql
+AS $$
+  SELECT t.* FROM backend.ticket t
+              JOIN backend.profile p ON userId = p.user_id
+              WHERE t.profile_id = p.profile_id
+               AND t.ticket_status = 'PAID'
+              ORDER BY t.departure_date ASC
+$$;
+
+COMMENT ON FUNCTION backend.find_paid_tickets_by_user_id(BIGINT) 
+IS  'Pobiera listę wszystkich opłaconych biletów dla wskazanego identyfikatora użytkownika.
+    Zwraca rekordy z tabeli ticket przefiltrowane po statusie PAID, posortowane według daty odjazdu.';
+
+
+CREATE OR REPLACE FUNCTION backend.fn_find_connections(
+    p_city_from VARCHAR,
+    p_city_to   VARCHAR,
+    p_date      DATE
+)
+RETURNS SETOF backend.t_connection
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_rec RECORD;
+    v_result backend.t_connection;
+    v_price_start NUMERIC(10,2);
+    v_price_end NUMERIC(10,2);
+    v_avail_seats INT;
+BEGIN
+    -- walidacja wejscia
+    IF p_city_from IS NULL OR TRIM(p_city_from) = '' THEN
+        RAISE EXCEPTION 'Parametr p_city_from nie moze byc pusty.';
+    END IF;
+    IF p_city_to IS NULL OR TRIM(p_city_to) = '' THEN
+        RAISE EXCEPTION 'Parametr p_city_to nie moze byc pusty.';
+    END IF;
+    IF LOWER(p_city_from) = LOWER(p_city_to) THEN
+        RAISE EXCEPTION 'Miasto odjazdu (%) i docelowe musza byc rozne.', p_city_from;
+    END IF;
+    IF p_date IS NULL THEN
+        RAISE EXCEPTION 'Parametr p_date nie moze byc NULL.';
+    END IF;
+    IF p_date < CURRENT_DATE THEN
+        RAISE EXCEPTION 'Data podrozy (%) nie moze byc z przeszlosci.', p_date;
+    END IF;
+
+    -- iteracja po pasujacych podrozach
+    FOR v_rec IN
+        SELECT
+            t.travel_id,
+            t.travel_train,
+            t.travel_departure,
+            t.travel_duration,
+            s_from.station_name AS from_station,
+            s_to.station_name AS to_station,
+            tr_from.travel_stop_number AS start_stop,
+            tr_to.travel_stop_number AS end_stop,
+            COALESCE(
+                t.travel_departure + tr_to.arrival_offset,
+                t.travel_departure + t.travel_duration
+            ) AS arrival_datetime
+        FROM backend.travel t
+        JOIN backend.travel_route tr_from ON tr_from.travel_id = t.travel_id
+        JOIN backend.station s_from
+            ON  s_from.station_id = tr_from.travel_station_stop_id
+            AND LOWER(s_from.station_name) = LOWER(p_city_from)
+        JOIN backend.travel_route tr_to
+            ON  tr_to.travel_id = t.travel_id
+            AND tr_to.travel_stop_number > tr_from.travel_stop_number
+        JOIN backend.station s_to
+            ON  s_to.station_id = tr_to.travel_station_stop_id
+            AND LOWER(s_to.station_name) = LOWER(p_city_to)
+        WHERE DATE(t.travel_departure) = p_date
+        ORDER BY t.travel_departure, tr_from.travel_stop_number
+    LOOP
+        -- roznica cen bazowych miedzy stopem koncowym a startowym
+        SELECT
+            MAX(CASE WHEN travel_stop_number = v_rec.start_stop THEN travel_price END),
+            MAX(CASE WHEN travel_stop_number = v_rec.end_stop   THEN travel_price END)
+        INTO v_price_start, v_price_end
+        FROM backend.travel_route
+        WHERE travel_id = v_rec.travel_id
+          AND travel_stop_number IN (v_rec.start_stop, v_rec.end_stop);
+
+        -- liczba wolnych miejsc na odcinku [start_stop, end_stop)
+        SELECT COUNT(*) INTO v_avail_seats
+        FROM backend.seat s
+        WHERE s.travel_id = v_rec.travel_id
+          AND NOT EXISTS (
+              SELECT 1 FROM backend.seat_reservation sr
+              WHERE sr.seat_id             = s.seat_id
+                AND sr.status             IN ('HELD', 'PURCHASED')
+                AND sr.start_stop_number   < v_rec.end_stop
+                AND sr.end_stop_number     > v_rec.start_stop
+          );
+
+        -- wypelnienie rekordu wynikowego
+        SELECT
+            v_rec.travel_id,
+            v_rec.travel_train,
+            v_rec.travel_departure,
+            v_rec.arrival_datetime,
+            v_rec.travel_duration,
+            v_rec.from_station,
+            NULL,
+            v_rec.to_station,
+            NULL,
+            v_rec.start_stop,
+            v_rec.end_stop,
+            v_price_end - v_price_start,
+            v_avail_seats
+        INTO v_result;
+
+        RETURN NEXT v_result;
+    END LOOP;
+
+    IF NOT FOUND THEN
+        RAISE NOTICE 'Brak polaczen z % do % na dzien %.', p_city_from, p_city_to, p_date;
+    END IF;
+
+    RETURN;
+END;
+$$;
+COMMENT ON FUNCTION backend.fn_find_connections(VARCHAR, VARCHAR, DATE) 
+IS 'Wyszukuje połączenia kolejowe między dwiema stacjami dla wskazanego dnia. 
+	Zwraca szczegóły trasy, czas przejazdu, obliczoną cenę odcinka oraz dostępność miejsc.';
